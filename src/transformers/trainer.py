@@ -457,7 +457,7 @@ class Trainer:
         validate_quantization_for_training(model)
 
         # ---- 4. Distributed strategy ------------------------------------------------
-        self.is_model_parallel = False
+        self.is_model_parallel = self._get_pp_size() > 1
         if getattr(model, "hf_device_map", None) is not None:
             devices = [device for device in set(model.hf_device_map.values()) if device not in ["cpu", "disk"]]
             if len(devices) > 1:
@@ -753,6 +753,16 @@ class Trainer:
             # find_unused_parameters breaks checkpointing as per
             # https://github.com/huggingface/transformers/pull/4659#issuecomment-643356021
             find_unused = not (self.model.is_gradient_checkpointing or self.args.gradient_checkpointing)
+            execution_config = self.model.config._get_layer_execution_config()
+            execution_order = execution_config.layer_execution_plan if execution_config is not None else None
+            if (
+                execution_config is not None
+                and execution_order is not None
+                and len(set(execution_order)) < execution_config.num_hidden_layers
+            ):
+                # Omitted source layers remain registered. DDP must account for their unused parameters,
+                # including when the plan uses the default non-reentrant gradient checkpointing.
+                find_unused = True
         else:
             find_unused = True
 
@@ -860,6 +870,8 @@ class Trainer:
 
         # create accelerator object
         self.accelerator = Accelerator(**args)
+        if self._get_pp_size() > 1 and self.accelerator.num_processes != self._get_pp_size():
+            raise ValueError("Looped pipeline Trainer requires a standalone PP group spanning all training processes.")
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics
 
@@ -1045,10 +1057,30 @@ class Trainer:
                 dataloader_params["drop_last"] = self.args.dataloader_drop_last
             if is_training:
                 dataloader_params["worker_init_fn"] = partial(
-                    seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
+                    seed_worker,
+                    num_workers=self.args.dataloader_num_workers,
+                    rank=self.args.process_index // self._get_pp_size(),
                 )
 
-        dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
+        if self._get_pp_size() > 1:
+            # Every pipeline stage consumes the same logical batch; only data-parallel groups shard data.
+            from accelerate.data_loader import prepare_data_loader
+
+            config = self.accelerator.dataloader_config
+            dataloader = prepare_data_loader(
+                DataLoader(dataset, **dataloader_params),
+                device=self.accelerator.device,
+                num_processes=1,
+                process_index=0,
+                put_on_device=True,
+                rng_types=self.accelerator.rng_types.copy(),
+                dispatch_batches=False,
+                use_seedable_sampler=config.use_seedable_sampler,
+                data_seed=config.data_seed,
+                use_stateful_dataloader=config.use_stateful_dataloader,
+            )
+        else:
+            dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
 
         # `BatchRebalanceSampler` is already rank-aware, so the `BatchSamplerShard` wrapper
         # added by `accelerator.prepare` would re-shard it and silently drop samples. Neutralise
@@ -1126,8 +1158,8 @@ class Trainer:
             elif isinstance(lengths, torch.Tensor):
                 lengths = lengths.tolist()
 
-            world_size = max(1, self.args.world_size)
-            rank = self.args.process_index if self.args.world_size > 1 else 0
+            world_size = max(1, self.args.world_size // self._get_pp_size())
+            rank = self.args.process_index // self._get_pp_size() if self.args.world_size > 1 else 0
             grad_accum = self.args.gradient_accumulation_steps
             effective_batch_size = self.args.train_batch_size * grad_accum * world_size
 
@@ -1727,12 +1759,13 @@ class Trainer:
         use_accelerator_prepare = model is self.model
 
         # prepare using `accelerator` prepare
-        if self.is_distributed_loading_by_transformers:
+        if self.is_distributed_loading_by_transformers or self._get_pp_size() > 1:
             # The model already owns placement and gradient reduction. Prepare autocast and compilation only,
             # without asking Accelerate to wrap the DTensor parameters in DDP or to shard them again.
             model = self.accelerator.prepare_model(model, device_placement=False, evaluation_mode=True)
             self.optimizer = self.accelerator.prepare(self.optimizer)
-            self._sync_replicated_trainable_parameters(model)
+            if self._get_pp_size() == 1:
+                self._sync_replicated_trainable_parameters(model)
         elif use_accelerator_prepare:
             if delay_optimizer_creation:
                 # TODO: check if we can move this somewhere else
@@ -2186,7 +2219,7 @@ class Trainer:
         ):
             # TP ranks (and the expert-parallel ranks sharing their batch) see replicated batches; `num_processes`
             # over-counts them by `tp_size`. Mirror the divisor used in `_get_num_items_in_batch`.
-            loss_scale = self.accelerator.num_processes // self.get_tp_size()
+            loss_scale = self.accelerator.num_processes // self.get_tp_size() // self._get_pp_size()
             loss *= loss_scale if self.args.n_gpu <= 1 else self.args.n_gpu
 
         return (loss, outputs) if return_outputs else loss
@@ -2336,7 +2369,7 @@ class Trainer:
                     num_items_in_batch = num_items_in_batch.unsqueeze(0).expand(self.args.n_gpu, -1)
                 # Divide by number of devices with the same batch
                 num_items_in_batch = num_items_in_batch // (
-                    self.get_tp_size() * self.get_cp_size() * self.get_sp_size()
+                    self.get_tp_size() * self.get_cp_size() * self.get_sp_size() * self._get_pp_size()
                 )
 
         return num_items_in_batch
@@ -2552,7 +2585,9 @@ class Trainer:
         All dimensions are separate and multiplicative: world_size = dp_size * tp_size * cp_size * sp_size
         """
 
-        dp_world_size = args.world_size // self.get_tp_size() // self.get_cp_size() // self.get_sp_size()
+        dp_world_size = (
+            args.world_size // self.get_tp_size() // self.get_cp_size() // self.get_sp_size() // self._get_pp_size()
+        )
         return self._train_batch_size * args.gradient_accumulation_steps * dp_world_size
 
     def get_sp_size(self) -> int:
@@ -2588,6 +2623,10 @@ class Trainer:
 
         # 4. Default fallback
         return 1
+
+    def _get_pp_size(self) -> int:
+        stage = getattr(self.model, "_pp_stage", None)
+        return stage.pp_size if stage is not None and getattr(stage, "layer_execution", False) else 1
 
     def _sync_replicated_trainable_parameters(self, model: nn.Module) -> None:
         """
@@ -2740,6 +2779,11 @@ class Trainer:
 
     def _clip_grad_norm(self, model):
         """Clip gradients to max_grad_norm. Returns the pre-clip gradient norm."""
+        if self._get_pp_size() > 1:
+            from .layer_execution.pipeline import pipeline_gradient_norm, unscale_pipeline_gradients
+
+            unscale_pipeline_gradients(self.accelerator, self.optimizer, self.model._pp_stage)
+            return pipeline_gradient_norm(self.model, self.args.max_grad_norm)
         if is_sagemaker_mp_enabled() and self.args.fp16:
             return self.optimizer.clip_master_grads(self.args.max_grad_norm)
         if self._has_mixed_mesh_grads(model):
@@ -2750,7 +2794,12 @@ class Trainer:
         """Return the gradient norm as a Python float."""
         if grad_norm is None:
             # Compute norm without clipping (inf means no actual clipping happens)
-            if self._has_mixed_mesh_grads(model):
+            if self._get_pp_size() > 1:
+                from .layer_execution.pipeline import pipeline_gradient_norm, unscale_pipeline_gradients
+
+                unscale_pipeline_gradients(self.accelerator, self.optimizer, self.model._pp_stage)
+                grad_norm = pipeline_gradient_norm(self.model, float("inf"))
+            elif self._has_mixed_mesh_grads(model):
                 grad_norm = self._mixed_mesh_grad_norm(model, float("inf"))
             else:
                 grad_norm = self.accelerator.clip_grad_norm_(model.parameters(), float("inf"))
@@ -2875,6 +2924,9 @@ class Trainer:
         Works both with or without labels.
         """
         args = self.args
+
+        if self._get_pp_size() > 1:
+            self.gather_function = lambda value, **kwargs: value
 
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
 
@@ -3478,6 +3530,16 @@ class Trainer:
 
     def _save_optimizer_and_scheduler(self, output_dir: str) -> None:
         """Save optimizer and learning rate scheduler states to `output_dir`."""
+        if self._get_pp_size() > 1:
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save(
+                self.optimizer.state_dict(),
+                os.path.join(output_dir, f"optimizer_pp_{self.model._pp_stage.pp_rank}.pt"),
+            )
+            if self.args.should_save:
+                torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+            dist.barrier(group=self.model._pp_stage.pp_group)
+            return
         if is_torch_xla_available():
             xm.rendezvous("saving_optimizer_states")
             if self.is_fsdp_xla_v1_enabled:
@@ -3849,6 +3911,15 @@ class Trainer:
         """If optimizer and scheduler states exist, load them."""
         if checkpoint is None:
             return
+        if self._get_pp_size() > 1:
+            path = os.path.join(checkpoint, f"optimizer_pp_{self.model._pp_stage.pp_rank}.pt")
+            if os.path.isfile(path):
+                check_torch_load_is_safe()
+                self.optimizer.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+                self.lr_scheduler.load_state_dict(
+                    torch.load(os.path.join(checkpoint, SCHEDULER_NAME), weights_only=True)
+                )
+            return
 
         if self.is_deepspeed_enabled:
             # deepspeed loads optimizer/lr_scheduler together with the model in deepspeed_init
@@ -4020,6 +4091,16 @@ class Trainer:
 
     def _issue_warnings_after_load(self, load_result: Any) -> None:
         """Log warnings for missing or unexpected keys after loading a checkpoint."""
+        unexpected_keys = load_result.unexpected_keys
+        if self._get_pp_size() > 1:
+            stage = self.model._pp_stage
+            unexpected_keys = [
+                key
+                for key in load_result.unexpected_keys
+                if (owner := stage.find_rank_for_key(key, stage.num_source_layers, self.model.base_model_prefix))
+                is None
+                or owner == stage.pp_rank
+            ]
         if len(load_result.missing_keys) != 0:
             if (
                 self.model._keys_to_ignore_on_save is not None
@@ -4029,10 +4110,8 @@ class Trainer:
                 self.model.tie_weights()
             else:
                 logger.warning(f"There were missing keys in the checkpoint model loaded: {load_result.missing_keys}.")
-        if len(load_result.unexpected_keys) != 0:
-            logger.warning(
-                f"There were unexpected keys in the checkpoint model loaded: {load_result.unexpected_keys}."
-            )
+        if len(unexpected_keys) != 0:
+            logger.warning(f"There were unexpected keys in the checkpoint model loaded: {unexpected_keys}.")
 
     # ---- Saving & Serialization ----
 
@@ -4046,7 +4125,9 @@ class Trainer:
         if output_dir is None:
             output_dir = self.args.output_dir
 
-        if is_torch_xla_available():
+        if self._get_pp_size() > 1:
+            self._save(output_dir)
+        elif is_torch_xla_available():
             save_tpu_checkpoint(
                 self.model, self.args, self.accelerator, self.processing_class, self.is_fsdp_xla_v1_enabled, output_dir
             )

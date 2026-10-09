@@ -298,6 +298,8 @@ class AssistedCandidateGenerator(CandidateGenerator):
             tokens_to_remove = current_cache_size - target_cache_size
             if tokens_to_remove >= 0:
                 self.assistant_kwargs["past_key_values"].crop(-tokens_to_remove)
+                if self.assistant_model.config._get_layer_execution_config() is not None:
+                    self.assistant_kwargs["past_key_values"].commit_past()
             self.assistant_kwargs = _prepare_attention_mask(
                 self.assistant_kwargs, input_ids.shape[-1], self.assistant_model.config.is_encoder_decoder
             )

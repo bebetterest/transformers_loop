@@ -141,7 +141,7 @@ def _pp_report_key_owners(
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Map checkpoint keys to their owning PP rank for the load report."""
     prefix = model.base_model_prefix
-    num_layers = len(getattr(model, prefix).layers)
+    num_layers = stage.num_source_layers if hasattr(stage, "num_source_layers") else len(getattr(model, prefix).layers)
 
     owned = dict.fromkeys(model.state_dict(), stage.pp_rank)
     skipped = {

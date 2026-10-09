@@ -30,6 +30,7 @@ CHECKER_CONFIG = {
         "src/transformers/modeling_utils.py",
         "src/transformers/utils",
         "src/transformers/generation",
+        "src/transformers/layer_execution",
         "src/transformers/pipelines/__init__.py",
         "src/transformers/pipelines/feature_extraction.py",
         "src/transformers/pipelines/image_feature_extraction.py",
