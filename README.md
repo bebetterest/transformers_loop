@@ -17,9 +17,9 @@ limitations under the License.
 
 # Transformers Loop
 
-This is an unofficial fork of [Hugging Face Transformers](https://github.com/huggingface/transformers), maintained by
-[bebetterest](https://github.com/bebetterest), with configurable decoder loop execution. It is not an official
-Hugging Face release. The original [Apache 2.0 license](LICENSE), copyright notices, and upstream attribution are retained.
+This is an unofficial fork of [Hugging Face Transformers](https://github.com/huggingface/transformers) with configurable
+decoder loop execution. It is not an official Hugging Face release. The original [Apache 2.0 license](LICENSE),
+copyright notices, and upstream attribution are retained.
 
 Use the [fork installation instructions](loop_readme.md#install-this-checkout) to install the loop implementation.
 The upstream README below describes the original project; upstream PyPI releases do not include this fork's loop extensions.
