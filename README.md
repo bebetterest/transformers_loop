@@ -25,6 +25,10 @@ Use the [fork installation instructions](loop_readme.md#install-this-checkout) t
 The upstream README below describes the original project; upstream PyPI releases do not include this fork's loop extensions.
 See [fork maintenance](MAINTENANCE.md) for pinned baselines, upstream synchronization, and validation requirements.
 
+**Upstream discussion:** See [issue #49488](https://github.com/huggingface/transformers/issues/49488) for the design discussion
+and [draft PR #49489](https://github.com/huggingface/transformers/pull/49489) for the reference implementation, supported
+features, and validation results. These submissions are shared for community review and maintainer evaluation.
+
 > **Configurable decoder loops:** This checkout supports repeating individual decoder layers, layer ranges, or the
 > whole stack while sharing the original weights and keeping independent execution caches. See the
 > [loop guide](loop_readme.md) for setup, examples, training and checkpoint rules, supported integrations, and implementation details.
