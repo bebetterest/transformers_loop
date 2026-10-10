@@ -297,6 +297,11 @@ for an initially configured plan, unless you override `ddp_find_unused_parameter
 may omit layers. Non-reentrant checkpointing supports repeated calls; explicit `use_reentrant=True` requires DDP's
 `static_graph=True` and a fixed execution graph. See the [PyTorch DDP documentation](https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html).
 
+The detailed CUDA and original-weight measurements below describe the pre-sync
+[`loop-baseline-2026-10-11`](https://github.com/bebetterest/transformers_loop/tree/loop-baseline-2026-10-11)
+at `e709e88b9d8db18a1648c023ba9d10f732dd2237`. Later upstream merges have separate regression results in
+[fork maintenance](https://github.com/bebetterest/transformers_loop/blob/main/MAINTENANCE.md).
+
 CPU validation uses tiny models on PyTorch 2.14.1. CUDA validation uses NVIDIA H20 devices on PyTorch 2.12.1 / CUDA 13.0,
 including a two-device NCCL 2.29.7 group with NVLink. The checks cover the original BF16 text weights from
 `Qwen/Qwen3.5-9B` at revision

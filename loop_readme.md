@@ -39,6 +39,7 @@ For the complete API, custom adapters, cache backends, and distributed validatio
 - [TRL integration status](#trl-integration-status)
 - [Accelerate integration status](#accelerate-integration-status)
 - [vLLM integration status](#vllm-integration-status)
+- [Versions and upstream maintenance](#versions-and-upstream-maintenance)
 - [Implementation and extensions](#implementation-map-and-extension-points)
 
 ## Install this checkout
@@ -59,6 +60,10 @@ python -m pip install -e ".[torch]"
 The APIs below require this checkout or another version containing the layer-execution implementation. Installing a
 separate upstream release does not make it support this checkout's plans. PEFT and TRL are optional dependencies for
 their respective examples.
+
+This checkout requires PyTorch 2.6 or newer when using the PyTorch backend. Pin a tested commit or tag for reproducible
+experiments; `main` receives reviewed upstream updates. See [fork maintenance](MAINTENANCE.md) for the synchronization
+procedure and the validation attached to each baseline.
 
 ## Quick start: repeat the second layer
 
@@ -430,6 +435,7 @@ Original full-parameter 9B runs use SGD; tiny and adapter runs use AdamW. These 
 For use with TRL:
 
 - Load a supported model through this checkout and set its plan before constructing the trainer. Preserve the planned base for automatic reference-model and adapter reloads, as described in [TRL references and LoRA](#trl-references-and-lora-adapter-checkpoints).
+- For a single-GPU script on a multi-GPU host, expose one device, for example `CUDA_VISIBLE_DEVICES=0 python train_loop.py`. For multiple GPUs, use `torchrun --standalone --nproc_per_node=2 train_loop.py` or the normal Accelerate launcher. TRL 1.15.0 SFTTrainer rejects the automatic `nn.DataParallel` path selected when several GPUs are visible to one plain Python process.
 - Use the normal trainer configuration and non-reentrant gradient checkpointing. For GRPO, set `use_vllm=False`; [TRL's configuration](https://huggingface.co/docs/trl/en/grpo_trainer) then uses Hugging Face generation. Both vLLM modes require the separate integration described below.
 - For DDP, use the same plan on every rank. For ZeRO-2/ZeRO-3, pass the usual DeepSpeed configuration to the trainer; this checkout installs the shared-gradient integration automatically. Follow the NF4 loading and precision rules above for QLoRA.
 
@@ -506,6 +512,11 @@ execution behavior. Otherwise, vLLM engine changes would also be necessary. This
 
 ## Recorded TRL validation
 
+The following full matrices describe the pre-sync baseline at
+[`loop-baseline-2026-10-11`](https://github.com/bebetterest/transformers_loop/tree/loop-baseline-2026-10-11)
+(`e709e88b9d8db18a1648c023ba9d10f732dd2237`). Later upstream synchronizations have their own regression results in
+[fork maintenance](MAINTENANCE.md); an earlier matrix does not establish that every combination was rerun on a later revision.
+
 On 2026-10-10, single-H20 validation used TRL 1.15.0, PEFT 0.21.2, Accelerate 1.15.0, and PyTorch 2.12.1+cu130.
 The checks used short synthetic data and rewards, and establish training mechanics rather than convergence or quality.
 
@@ -553,6 +564,23 @@ initialization, full-parameter 9B AdamW, Liger, Unsloth, packing/padding-free mo
 architecture combinations require separate validation. FSDP1, combined parallel layouts, and optimized recurrent
 kernels also require separate integration or validation. ZeRO-3 integration is version-bounded because it relies on
 DeepSpeed's gradient-readiness and reduction APIs.
+
+## Versions and upstream maintenance
+
+The fork keeps the upstream commit history and layers the loop extension on top. Upstream updates are merged in an
+integration branch, checked against loop behavior and the affected upstream paths, and published on `main` after
+validation. Existing experiment tags remain fixed. Install a baseline explicitly when comparing runs:
+
+```bash
+git clone https://github.com/bebetterest/transformers_loop.git
+cd transformers_loop
+git switch --detach loop-baseline-2026-10-11
+python -m pip install -e ".[torch]"
+```
+
+Pin the Python dependencies, model revision, execution plan, cache backend, and distributed layout as well. A Git tag
+pins the fork's source; it does not pin optional dependencies or downloaded model weights. See
+[fork maintenance](MAINTENANCE.md) for the current synchronization record and repeatable checks.
 
 ## Implementation map and extension points
 
