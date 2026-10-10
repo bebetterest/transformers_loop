@@ -1,3 +1,4 @@
+# Modified by bebetterest in 2026 for configurable decoder layer execution.
 """Run ty type checking on specified directories.
 
 Usage:

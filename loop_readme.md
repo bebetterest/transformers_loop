@@ -43,6 +43,13 @@ For the complete API, custom adapters, cache backends, and distributed validatio
 
 ## Install this checkout
 
+Clone the loop-enabled fork:
+
+```bash
+git clone https://github.com/bebetterest/transformers_loop.git
+cd transformers_loop
+```
+
 Run this from the repository root in your Python environment:
 
 ```bash

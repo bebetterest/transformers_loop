@@ -1,3 +1,4 @@
+# Modified by bebetterest in 2026 for configurable decoder layer execution.
 # Copyright 2018 the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

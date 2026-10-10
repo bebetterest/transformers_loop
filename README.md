@@ -1,5 +1,6 @@
 <!---
 Copyright 2020 The HuggingFace Team. All rights reserved.
+Modified by bebetterest in 2026 for configurable decoder layer execution.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,6 +14,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
+
+# Transformers Loop
+
+This is an unofficial fork of [Hugging Face Transformers](https://github.com/huggingface/transformers), maintained by
+[bebetterest](https://github.com/bebetterest), with configurable decoder loop execution. It is not an official
+Hugging Face release. The original [Apache 2.0 license](LICENSE), copyright notices, and upstream attribution are retained.
+
+Use the [fork installation instructions](loop_readme.md#install-this-checkout) to install the loop implementation.
+The upstream README below describes the original project; upstream PyPI releases do not include this fork's loop extensions.
 
 > **Configurable decoder loops:** This checkout supports repeating individual decoder layers, layer ranges, or the
 > whole stack while sharing the original weights and keeping independent execution caches. See the
