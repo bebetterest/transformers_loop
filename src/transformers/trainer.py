@@ -1800,6 +1800,9 @@ class Trainer:
         # TODO: check if we really need this
         if self.is_deepspeed_enabled:
             self.deepspeed = self.model_wrapped
+            from .layer_execution.deepspeed import configure_deepspeed_layer_execution
+
+            configure_deepspeed_layer_execution(self.deepspeed)
 
         # Important: at this point:
         # self.model         is the Transformers Model except when we are using FSDP
@@ -3575,7 +3578,7 @@ class Trainer:
             accept_exclude_frozen_parameters = "exclude_frozen_parameters" in set(
                 inspect.signature(self.model_wrapped.save_checkpoint).parameters.keys()
             )
-            if accept_exclude_frozen_parameters and _is_peft_model(self.model):
+            if accept_exclude_frozen_parameters and self._exclude_frozen_deepspeed_parameters():
                 self.model_wrapped.save_checkpoint(output_dir, exclude_frozen_parameters=True)
             else:
                 self.model_wrapped.save_checkpoint(output_dir)
@@ -3626,6 +3629,14 @@ class Trainer:
             reissue_pt_warnings(caught_warnings)
 
     # ---- Checkpoint Resuming ----
+
+    @staticmethod
+    def _load_peft_adapter(model, checkpoint, adapter_name, **kwargs):
+        # Preserve the precision policy already selected for an existing adapter and its optimizer state.
+        # PEFT otherwise promotes FP16/BF16 adapters to FP32 when loading their weights again.
+        if adapter_name in model.peft_config:
+            kwargs["autocast_adapter_dtype"] = False
+        return model.load_adapter(checkpoint, adapter_name, **kwargs)
 
     def _load_from_checkpoint(self, resume_from_checkpoint: str, model: nn.Module | None = None) -> None:
         """Load model weights from a checkpoint directory."""
@@ -3736,12 +3747,20 @@ class Trainer:
                     active_adapter = active_adapters[0]
 
                     if adapter_subdirs:
+                        # PEFT saves the default adapter at the checkpoint root, even when other adapters
+                        # (for example a TRL reference adapter) are saved in named subdirectories.
+                        if os.path.isfile(adapter_weights_file) or os.path.isfile(adapter_safe_weights_file):
+                            self._load_peft_adapter(
+                                model, resume_from_checkpoint, "default", is_trainable=(active_adapter == "default")
+                            )
                         for subdir_name in adapter_subdirs:
                             peft_id = os.path.join(resume_from_checkpoint, subdir_name)
-                            model.load_adapter(peft_id, subdir_name, is_trainable=(subdir_name == active_adapter))
+                            self._load_peft_adapter(
+                                model, peft_id, subdir_name, is_trainable=(subdir_name == active_adapter)
+                            )
                         model.set_adapter(active_adapter)
                     else:
-                        model.load_adapter(resume_from_checkpoint, active_adapter, is_trainable=True)
+                        self._load_peft_adapter(model, resume_from_checkpoint, active_adapter, is_trainable=True)
                 else:
                     logger.warning(
                         "The intermediate checkpoints of PEFT may not be saved correctly, "
@@ -3761,10 +3780,19 @@ class Trainer:
         logger.info(f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric}).")
         best_model_path = os.path.join(self.state.best_model_checkpoint, WEIGHTS_NAME)
         best_safe_model_path = os.path.join(self.state.best_model_checkpoint, SAFE_WEIGHTS_NAME)
-        best_adapter_model_path = os.path.join(self.state.best_model_checkpoint, ADAPTER_WEIGHTS_NAME)
-        best_safe_adapter_model_path = os.path.join(self.state.best_model_checkpoint, ADAPTER_SAFE_WEIGHTS_NAME)
 
         model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
+        best_adapter_checkpoint = self.state.best_model_checkpoint
+        if _is_peft_model(model) and hasattr(model, "active_adapters") and model.active_adapters:
+            named_adapter_checkpoint = os.path.join(best_adapter_checkpoint, model.active_adapters[0])
+            if any(
+                os.path.isfile(os.path.join(named_adapter_checkpoint, filename))
+                for filename in (ADAPTER_WEIGHTS_NAME, ADAPTER_SAFE_WEIGHTS_NAME)
+            ):
+                best_adapter_checkpoint = named_adapter_checkpoint
+        best_adapter_model_path = os.path.join(best_adapter_checkpoint, ADAPTER_WEIGHTS_NAME)
+        best_safe_adapter_model_path = os.path.join(best_adapter_checkpoint, ADAPTER_SAFE_WEIGHTS_NAME)
+
         if self.is_deepspeed_enabled:
             deepspeed_load_checkpoint(
                 self.model_wrapped,
@@ -3803,7 +3831,7 @@ class Trainer:
 
                         if os.path.exists(best_adapter_model_path) or os.path.exists(best_safe_adapter_model_path):
                             try:
-                                model.load_adapter(self.state.best_model_checkpoint, active_adapter)
+                                self._load_peft_adapter(model, best_adapter_checkpoint, active_adapter)
                             except RuntimeError as exc:
                                 if model.peft_config[active_adapter].is_prompt_learning:
                                     # for context: https://github.com/huggingface/peft/issues/2256
@@ -4115,6 +4143,11 @@ class Trainer:
 
     # ---- Saving & Serialization ----
 
+    def _exclude_frozen_deepspeed_parameters(self) -> bool:
+        # Multiple adapters can include a frozen reference whose weights must survive cold resume.
+        # DeepSpeed's exclusion flag cannot distinguish those weights from the frozen base model.
+        return _is_peft_model(self.model) and len(self.model.peft_config) == 1
+
     def save_model(self, output_dir: str | None = None, _internal_call: bool = False) -> None:
         """
         Will save the model, so you can reload it using `from_pretrained()`.
@@ -4149,7 +4182,7 @@ class Trainer:
                     inspect.signature(self.model_wrapped.save_checkpoint).parameters.keys()
                 )
                 zero3_sharding = self.deepspeed.config.get("zero_optimization", {}).get("stage", None) == 3
-                if accept_exclude_frozen_parameters and _is_peft_model(self.model) and zero3_sharding:
+                if accept_exclude_frozen_parameters and self._exclude_frozen_deepspeed_parameters() and zero3_sharding:
                     # When using PEFT with DeepSpeed ZeRO Stage 3,
                     # we do not need to load the frozen parameters
                     state_dict = self.deepspeed._zero3_consolidated_16bit_state_dict(exclude_frozen_parameters=True)
@@ -4196,16 +4229,18 @@ class Trainer:
                 state_dict = self.model.state_dict()
 
             if isinstance(self.accelerator.unwrap_model(self.model, keep_torch_compile=False), supported_classes):
-                self.accelerator.unwrap_model(self.model, keep_torch_compile=False).save_pretrained(
-                    output_dir, state_dict=state_dict
-                )
+                model_to_save = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+                save_kwargs = {"save_original_format": False} if isinstance(model_to_save, PreTrainedModel) else {}
+                model_to_save.save_pretrained(output_dir, state_dict=state_dict, **save_kwargs)
             else:
                 logger.info("Trainer.model is not a `PreTrainedModel`, only saving its state dict.")
                 safetensors.torch.save_file(
                     state_dict, os.path.join(output_dir, SAFE_WEIGHTS_NAME), metadata={"format": "pt"}
                 )
         else:
-            self.model.save_pretrained(output_dir, state_dict=state_dict)
+            # Trainer reloads state_dict keys directly; reversed export conversions would make them incompatible.
+            save_kwargs = {"save_original_format": False} if isinstance(self.model, PreTrainedModel) else {}
+            self.model.save_pretrained(output_dir, state_dict=state_dict, **save_kwargs)
 
         # A non-writer rank of a model sharded at load time is only here for the collectives above.
         if not self.args.should_save:

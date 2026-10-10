@@ -276,6 +276,31 @@ class LayerExecutionModelTest(unittest.TestCase):
             self.assertFalse(trainer._build_accelerator_args()["kwargs_handlers"][0].find_unused_parameters)
 
     @parameterized.expand([("llama",), ("qwen3_5",)])
+    def test_no_grad_rollout_cache_preserves_training_mode(self, family):
+        model = self.make_model(family)
+        model.set_layer_execution_plan([0, 1, 1, 2])
+        model.train()
+        inputs = torch.tensor([[1, 2, 3]])
+        for context in (torch.no_grad, torch.inference_mode):
+            with context():
+                cache = model(inputs, use_cache=True).past_key_values
+                self.assertIsInstance(cache, LayerExecutionCache)
+                output = model(torch.tensor([[4]]), past_key_values=cache).logits
+                reference = model(torch.tensor([[1, 2, 3, 4]]), use_cache=False).logits[:, -1:]
+                torch.testing.assert_close(output, reference, atol=3e-5, rtol=3e-4)
+                torch.testing.assert_close(
+                    model.generate(inputs, max_new_tokens=3),
+                    model.generate(inputs, max_new_tokens=3, use_cache=False),
+                )
+            self.assertTrue(model.training)
+        with self.assertRaisesRegex(ValueError, "requires past_key_values=None"):
+            model(inputs, past_key_values=cache)
+        output = model(inputs, labels=inputs, use_cache=True)
+        self.assertIsNone(output.past_key_values)
+        output.loss.backward()
+        self.assertTrue(all(parameter.grad is not None for parameter in model.parameters()))
+
+    @parameterized.expand([("llama",), ("qwen3_5",)])
     def test_cache_views_expose_source_metadata(self, family):
         from transformers.layer_execution.cache import _ExecutionCacheView
 

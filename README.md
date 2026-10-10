@@ -14,6 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
+> **Configurable decoder loops:** This checkout supports repeating individual decoder layers, layer ranges, or the
+> whole stack while sharing the original weights and keeping independent execution caches. See the
+> [loop guide](loop_readme.md) for setup, examples, training and checkpoint rules, supported integrations, and implementation details.
+>
+> **TRL / Accelerate:** The validated training paths use unmodified TRL and Accelerate packages. Loop and Trainer
+> integration lives in this Transformers checkout. See [TRL status](loop_readme.md#trl-integration-status) and
+> [Accelerate status](loop_readme.md#accelerate-integration-status) for tested versions, setup, and limits.
+>
+> **vLLM:** Execution plans are not integrated with vLLM, including its Transformers backend. TRL GRPO must use
+> `use_vllm=False` for this loop implementation. See [vLLM integration status](loop_readme.md#vllm-integration-status).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://huggingface.co/datasets/huggingface/documentation-images/raw/main/transformers-logo-dark.svg">

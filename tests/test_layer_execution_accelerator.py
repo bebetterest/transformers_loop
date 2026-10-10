@@ -44,6 +44,11 @@ class LayerExecutionAcceleratorTest(unittest.TestCase):
         model = execution_tests.LayerExecutionModelTest().make_model(family).cuda()
         order = (0, 1, 0, 1, 2)
         model.set_layer_execution_plan(order)
+        # Initialize CUDA linalg before DataParallel starts its replica threads (pytorch/pytorch#90613).
+        # Qwen3.5's reference recurrent kernel also triggers this race without an execution plan.
+        if family == "qwen3_5" and torch.cuda.device_count() > 1:
+            with torch.no_grad():
+                model(torch.tensor([[1, 2, 3, 4]], device="cuda"), use_cache=False)
         dataset = [{"input_ids": [1, index + 2, 3, 4], "labels": [1, index + 2, 3, 4]} for index in range(8)]
         with tempfile.TemporaryDirectory() as directory:
             arguments = TrainingArguments(

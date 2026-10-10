@@ -168,8 +168,11 @@ Initialize/start the manager on every TP or PP rank, and submit requests on its 
 ## Training and checkpoints
 
 The execution graph contains every repeated call. Gradients from all uses flow into the original shared parameters;
-there are no detached loop boundaries or extra optimizer parameters. Training disables caching and requires
-`past_key_values=None`. Non-reentrant gradient checkpointing can reduce activation memory:
+there are no detached loop boundaries or extra optimizer parameters. Gradient-enabled training disables caching and
+requires `past_key_values=None`. Generation under `torch.no_grad()` or `torch.inference_mode()` can use independent
+execution caches while the model remains in training mode, as needed by reinforcement learning trainers. Disable
+gradient checkpointing during generation and restore it before training. Non-reentrant gradient checkpointing can
+reduce activation memory:
 
 ```python
 model.train()
@@ -196,6 +199,66 @@ assert model.get_layer_execution_plan() is None
 Use the setter to update a loaded model; editing `config.json` applies on the next load. Changing or disabling a plan
 does not reset learned weights. Reconfigure between complete forward/backward steps, and discard any existing cache.
 
+### TRL references and PEFT adapter checkpoints
+
+The recorded SFT/DPO/GRPO paths use unmodified TRL 1.15.0 and Accelerate 1.15.0. They require this Transformers
+checkout, which provides model plan dispatch, execution-local caches, Trainer checkpoint handling, and automatic
+ZeRO-3 shared-gradient integration. No TRL or Accelerate source fork is required for these tested configurations.
+
+An in-memory policy plan is not automatically copied to a reference model that a trainer reloads from the original
+checkpoint. Saving only a PEFT adapter also does not serialize an in-memory base plan: automatic adapter loading
+follows the base model path recorded in the adapter configuration. When all of these models should use the same
+plan, save a planned base checkpoint and reload it before constructing the trainer or adapter:
+
+```python
+model.save_pretrained("planned-base")
+policy = AutoModelForCausalLM.from_pretrained("planned-base")
+# Pass policy to the trainer, or create the PEFT adapter from policy.
+```
+
+Keep that base checkpoint accessible for adapter reloads. Alternatively, explicitly configure the DPO reference and
+restore the base plan before loading an adapter. Policy and reference plans may intentionally differ. The public
+plan functions accept standard PEFT wrappers. Single-GPU SFT, DPO, and GRPO with Hugging Face generation were checked
+on TRL 1.15.0 / PEFT 0.21.2 with Llama and Qwen3.5, including original Qwen3.5-9B full-parameter and LoRA training.
+GRPO used `use_vllm=False`. A two-H20 follow-up has completed SFT/DPO/GRPO × full/LoRA/NF4 QLoRA ×
+DDP/ZeRO-2/ZeRO-3 with the second layer repeated for both tiny Qwen3.5 and original Qwen3.5-9B (27 cases each),
+including separate-process training-state resume. Tiny cases also compare resumed and uninterrupted updates.
+An additional 15 tiny training cases cover Llama QLoRA across those trainers/backends and Qwen3.5 SFT QLoRA
+range/whole-stack repetition. Six nonzero-reference DPO LoRA/QLoRA cases check frozen-adapter preservation across
+cold resume on all three backends. Twelve additional original 9B SFT LoRA/QLoRA cases cover range/whole-stack
+repetition across all three backends and dynamic/static/offloaded/offloaded-static generation caches. The complete
+selected matrix has 87 passing configurations, 180 training phases, and 360 rank records. Interrupted and corrected
+attempts are preserved separately. Full-parameter 9B runs use SGD; tiny and adapter runs use AdamW. These results do
+not establish full-parameter 9B AdamW, load-time ZeRO-3 initialization, optimizer offload, or other TRL combinations.
+vLLM loop execution is not implemented or runtime-validated, including its Transformers backend and TRL's vLLM
+server/colocate modes. These paths require separate integration of the execution plan and vLLM-managed state.
+For trainer gradient checkpointing, use `gradient_checkpointing_kwargs={"use_reentrant": False}`.
+TRL 1.15.0's GRPOTrainer initially overrides this to reentrant checkpointing for PEFT with ZeRO-3. Its generation
+utility later re-enables checkpointing without arguments, selecting this checkout's non-reentrant default. The
+checks follow those ordinary utilities. Custom contexts should explicitly restore their intended keyword arguments.
+Native non-reentrant ZeRO training is also checked against expanded layers.
+
+Trainer preserves existing adapter dtypes, restores both a root-level PEFT `default` adapter and named directories,
+and selects the active adapter's path for best-checkpoint loading. Multi-adapter DeepSpeed checkpoints retain frozen
+reference parameters, and ZeRO-3 exports gather their weights. DeepSpeed's exclusion flag covers all frozen parameters,
+so these training checkpoints can include the frozen base and be larger than single-adapter checkpoints.
+Trainer saves full-model checkpoints in their current
+runtime key format for direct `state_dict` resume. NF4 validation uses BF16 compute and quantization storage, places
+each rank's quantized model on its own GPU, and reapplies the same k-bit preparation and backend precision policy
+when reloading. DeepSpeed 0.19.7 casts parameters while preserving FP32 buffers such as RoPE frequencies.
+
+### Accelerate integration
+
+Accelerate 1.15.0 is exercised through Trainer on single-GPU, two-GPU DDP, and ZeRO-2/ZeRO-3 paths. Set the plan before
+Trainer or `Accelerator.prepare(...)`; the underlying model retains its shared parameters and performs the loop.
+For a standalone Accelerate/DeepSpeed ZeRO-3 loop, call `configure_deepspeed_layer_execution` on the engine returned
+by `prepare(...)` before training. Trainer installs this coordinator automatically; standalone `prepare(...)` does not.
+Preserve the planned model configuration when restoring a custom loop's training checkpoint.
+
+These Trainer checks do not establish all standalone Accelerate plugins or launch configurations. Native PyTorch
+FSDP2/TP/PP checks are separate; the corresponding Accelerate/TRL paths, combined parallel layouts, other accelerators,
+and physical multi-host operation require independent integration or validation.
+
 ## Distributed execution
 
 The executor calls the original blocks through their normal module interface. DDP reduction hooks, FSDP sharding hooks,
@@ -210,6 +273,23 @@ from transformers import get_layer_execution_plan, set_layer_execution_plan
 set_layer_execution_plan(ddp_model, repeats=[RepeatRange(1, 2)])
 print(get_layer_execution_plan(ddp_model).layer_order)
 ```
+
+Trainer configures repeated source gradients automatically after DeepSpeed initialization. For a manual engine,
+call the integration after setting the plan and initializing DeepSpeed:
+
+```python
+import deepspeed
+from transformers.layer_execution.deepspeed import configure_deepspeed_layer_execution
+
+# Supply resolved numeric batch sizes and your optimizer settings in deepspeed_config.
+engine, optimizer, _, _ = deepspeed.initialize(model=model, config=deepspeed_config)
+configure_deepspeed_layer_execution(engine)
+```
+
+For ZeRO-3, this defers reduction of a repeated source parameter until its full backward contribution has accumulated,
+then uses the optimizer's ordinary reduction/partitioning. Source registrations and optimizer groups remain unchanged.
+Use `set_layer_execution_plan(engine, ...)` for later plan changes between complete steps. The integration is verified
+with DeepSpeed 0.19.7; other releases require checks of the reduction API and backward-hook ordering.
 
 All ranks must use the same plan. Synchronize changes between complete training steps. For manual DDP, set
 `find_unused_parameters=True` if an explicit order omits any source layer. `Trainer` selects this setting automatically
@@ -246,10 +326,12 @@ including a two-device NCCL 2.29.7 group with NVLink. The checks cover the origi
 | Multiple physical hosts | Deferred; the two-node launch checks run on one physical host |
 
 The distributed checks compare against independently expanded logical layers and sum their gradients into each source
-parameter. Floating-point comparisons allow the different reduction order used by parallel kernels. FSDP1,
-DeepSpeed, combined parallel layouts, optimized recurrent
-FLA/causal-convolution kernels, and weight-quantized models still need separate validation. Models without an enabled
-plan retain their native execution paths.
+parameter. Floating-point comparisons allow the different reduction order used by parallel kernels. Additional
+two-device NF4 and ZeRO-2/ZeRO-3 regressions check shared gradients, optimizer updates, independent caches and adapter
+reload. These do not establish every TRL/distributed combination; the version-bounded matrix is described above.
+FSDP1, combined parallel layouts, optimized recurrent FLA/causal-convolution kernels, CPU/NVMe optimizer offload and
+other weight quantizers still need separate validation. Models without an enabled plan retain their native execution
+paths.
 
 The simulated-node regression starts two independent `torchrun` agents with `--nnodes=2` and
 `--nproc-per-node=1`. Each worker sees one distinct physical GPU, has `LOCAL_RANK=0`, and receives its global rank
@@ -412,7 +494,8 @@ The implementation is split by responsibility under `src/transformers/layer_exec
 and dependencies; `state.py` defines structured streams; `cache.py` routes state and rollback; `backends.py` selects
 storage; `adapters.py` and `model_adapters.py` handle model semantics; `pipeline.py` handles communication, gradients,
 and checkpoint gathering; `continuous.py` and `paged.py` handle request scheduling and paged routing; `executor.py`
-configures models and runs shared modules. Adding an adapter does not require rewriting the plan or cache engine.
+configures models and runs shared modules. `deepspeed.py` completes repeated source gradients before ZeRO-3 reduction.
+Adding an adapter does not require rewriting the plan or cache engine.
 
 ## API
 

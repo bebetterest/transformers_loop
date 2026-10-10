@@ -23,7 +23,7 @@ import torch
 from typing_extensions import Unpack
 
 from ..cache_utils import Cache
-from ..utils import ModelOutput, TransformersKwargs
+from ..utils import ModelOutput, TransformersKwargs, is_peft_available
 from ..utils.generic import merge_with_config_defaults
 from ..utils.output_capturing import _active_collector, capture_outputs
 from .adapters import _get_adapter_class
@@ -68,8 +68,13 @@ def _get_model_and_decoder(model: torch.nn.Module):
     from ..modeling_utils import PreTrainedModel, unwrap_model
 
     unwrapped = unwrap_model(model)
+    if not isinstance(unwrapped, PreTrainedModel) and is_peft_available():
+        from peft import PeftModel
+
+        if isinstance(unwrapped, PeftModel):
+            unwrapped = unwrap_model(unwrapped.get_base_model())
     if not isinstance(unwrapped, PreTrainedModel):
-        raise TypeError("Layer execution requires a PreTrainedModel or its distributed wrapper.")
+        raise TypeError("Layer execution requires a PreTrainedModel or its distributed/PEFT wrapper.")
     # Unwrap only the containers being configured. Keep wrappers and hooks around individual blocks intact.
     decoder = unwrap_model(unwrapped.get_decoder())
     visited = set()
@@ -90,7 +95,7 @@ def get_layer_execution_plan(model: torch.nn.Module) -> LayerExecutionPlan | Non
     """Return an immutable snapshot of a model's current decoder execution plan.
 
     Args:
-        model (`torch.nn.Module`): Model, optionally wrapped in a distributed container.
+        model (`torch.nn.Module`): Model, optionally wrapped in a distributed or PEFT container.
     """
     _, decoder = _get_model_and_decoder(model)
     order = decoder.config.layer_execution_plan
@@ -106,7 +111,7 @@ def set_layer_execution_plan(
     """Enable or disable a shared-parameter execution plan on a supported decoder-only text stack.
 
     Args:
-        model (`torch.nn.Module`): Loaded model, optionally wrapped in a distributed container.
+        model (`torch.nn.Module`): Loaded model, optionally wrapped in a distributed or PEFT container.
         plan (`LayerExecutionPlan`, `Sequence[int]` or `None`, *optional*): Explicit execution order. Omitting both
             `plan` and `repeats` restores the original forward.
         repeats (`Sequence[RepeatRange]`, *optional*): Compile repeat ranges using the decoder's source layer count.
@@ -147,6 +152,10 @@ def set_layer_execution_plan(
         if pipeline is not None and getattr(pipeline, "layer_execution", False):
             pipeline.layer_execution = False
             unwrapped.forward = unwrapped._pp_native_forward
+        if callable(getattr(model, "zero_optimization_stage", None)):
+            from .deepspeed import configure_deepspeed_layer_execution
+
+            configure_deepspeed_layer_execution(model)
         return model
     adapter_class = _get_adapter_class(decoder.config.model_type)
     if adapter_class is None:
@@ -184,6 +193,10 @@ def set_layer_execution_plan(
 
         unwrapped.forward = unwrapped._pp_original_forward
         configure_pipeline(unwrapped, pipeline)
+    if callable(getattr(model, "zero_optimization_stage", None)):
+        from .deepspeed import configure_deepspeed_layer_execution
+
+        configure_deepspeed_layer_execution(model)
     return model
 
 
@@ -207,7 +220,8 @@ def _execute_decoder(
             past_key_values = named_cache
     if (input_ids is None) == (inputs_embeds is None):
         raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
-    if self.training:
+    # RL trainers can generate under no_grad while leaving the policy in training mode.
+    if self.training and torch.is_grad_enabled():
         if past_key_values is not None:
             raise ValueError("Training a layer execution plan requires past_key_values=None.")
         use_cache = False

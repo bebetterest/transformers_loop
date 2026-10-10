@@ -74,6 +74,7 @@ def _run_two_node_case(directory, case, device_type):
             environment = {
                 **os.environ,
                 "CUDA_VISIBLE_DEVICES": str(node_rank) if device_type == "cuda" else "",
+                "TRANSFORMERS_TEST_DEVICE": device_type,
                 "OMP_NUM_THREADS": "1",
                 "HF_HUB_OFFLINE": "1",
                 "PYTHONPATH": str(repository / "src") + os.pathsep + str(repository),
